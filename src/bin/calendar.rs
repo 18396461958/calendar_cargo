@@ -34,15 +34,15 @@
 #![no_main]
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike, Weekday};
-use defmt_rtt as _; // Global logger
+use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_stm32::{
     bind_interrupts,
     gpio::{Output, Speed, Level, Pull},
-    i2c::{self, EventInterruptHandler, ErrorInterruptHandler},
+    i2c::{self, EventInterruptHandler, ErrorInterruptHandler, Master},
     peripherals,
-    exti::ExtiInput,
     time::Hertz,
+    exti::ExtiInput,
     timer::qei::{Qei, QeiPin},
 };
 use embedded_graphics::{
@@ -57,7 +57,7 @@ use embassy_sync::{
     channel::{Channel, Receiver, Sender},
 };
 use embassy_time::{Ticker, Timer};
-use panic_probe as _; // Panic handler
+use panic_probe as _;
 use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
 use heapless::String;
 use core::fmt::Write;
@@ -82,7 +82,8 @@ async fn main(_spawner: Spawner) {
         I2C1_EV => EventInterruptHandler<peripherals::I2C1>;
         I2C1_ER => ErrorInterruptHandler<peripherals::I2C1>;
     });
-
+    let mut config = i2c::Config::default();
+    config.frequency = Hertz(400); // 降低到 100kHz
     // Configure I2C peripheral at 400kHz
     let i2c = i2c::I2c::new(
         p.I2C1,
@@ -91,15 +92,14 @@ async fn main(_spawner: Spawner) {
         Irqs,
         p.DMA1_CH6,
         p.DMA1_CH7,
-        Hertz::khz(400),
-        Default::default(),
+        config,
     );
 
     // Configure rotary encoder via TIM1 quadrature interface
     let encoder = Qei::new(
         p.TIM1,
-        QeiPin::new_ch1(p.PA8),
-        QeiPin::new_ch2(p.PA9)
+        QeiPin::new(p.PA8),
+        QeiPin::new(p.PA9)
     );
 
     // Configure button with external interrupt (pull-up configuration)
@@ -110,7 +110,7 @@ async fn main(_spawner: Spawner) {
         i2c, 
         RTC_CHANNEL.receiver(), 
         KEY_CHANNEL.receiver(),
-        embassy_time::Duration::from_millis(100) // Refresh every 100ms
+        embassy_time::Duration::from_millis(100)
     )).unwrap();
 
     // Spawn RTC update task
@@ -118,52 +118,46 @@ async fn main(_spawner: Spawner) {
         RTC_CHANNEL.sender(), 
         KEY_CHANNEL.receiver(),
         ARE_CHANNEL.receiver(),
-        embassy_time::Duration::from_millis(30) // Update interval
+        embassy_time::Duration::from_millis(30)
     )).unwrap();
 
     // Spawn rotary encoder processing task
     _spawner.spawn(are_update(
         encoder, 
         ARE_CHANNEL.sender(),
-        embassy_time::Duration::from_millis(100) // Polling interval
+        embassy_time::Duration::from_millis(100)
     )).unwrap();
 
     // Spawn button processing task
     _spawner.spawn(key_update(
         key_exti, 
         KEY_CHANNEL.sender(),
-        embassy_time::Duration::from_millis(10) // Debounce interval
+        embassy_time::Duration::from_millis(10)
     )).unwrap();
 
     // Configure onboard LED (PC13) as heartbeat indicator
     let mut led = Output::new(p.PC13, Level::High, Speed::Low);
     let mut ticker = Ticker::every(embassy_time::Duration::from_millis(500));
     
-    // Main heartbeat loop - blinks onboard LED
+    // Main heartbeat loop
     loop {
-        led.set_low();  // LED on
+        led.set_low();
         ticker.next().await;
-        led.set_high(); // LED off
+        led.set_high();
         ticker.next().await;
     }
 }
 
 /// OLED Display Rendering Task
-/// 
-/// Responsibilities:
-/// 1. Manage SSD1306 display interface
-/// 2. Render date/time information
-/// 3. Handle setting mode cursor
-/// 4. Implement blinking cursor effect
 #[embassy_executor::task]
 async fn oled_display(
-    i2c: i2c::I2c<'static, embassy_stm32::mode::Async>,
+    i2c: i2c::I2c<'static, embassy_stm32::mode::Async, Master>,
     rtc_channel: Receiver<'static, ThreadModeRawMutex, NaiveDateTime, 2>, 
     key_channel: Receiver<'static, ThreadModeRawMutex, i32, 1>,
     delay: embassy_time::Duration
 ) {
     let mut ticker = Ticker::every(delay);
-    ticker.next().await; // Initial delay
+    ticker.next().await;
 
     // Initialize display interface and controller
     let interface = I2CDisplayInterface::new(i2c);
@@ -173,7 +167,16 @@ async fn oled_display(
         DisplayRotation::Rotate0
     ).into_buffered_graphics_mode();
     
-    display.init().unwrap();
+    // 在 oled_display 任务中
+    match display.init() {
+        Ok(_) => None,
+        Err(_e) => {
+             core::prelude::v1::Some(loop {
+
+            })
+            // 进入错误处理状态
+        }
+    };
 
     // Configure text rendering styles
     let year_month_day_style = MonoTextStyleBuilder::new()
@@ -198,22 +201,16 @@ async fn oled_display(
 
     // Field positions for cursor rendering
     const CURSOR_POSITIONS: [(Point, Point); 6] = [
-        // Year: (start, end)
         (Point::new(24, 18), Point::new(24 + 4 * 8, 18)),
-        // Month
         (Point::new(24 + 5 * 8, 18), Point::new(24 + 7 * 8, 18)),
-        // Day
         (Point::new(24 + 8 * 8, 18), Point::new(24 + 10 * 8, 18)),
-        // Hour
         (Point::new(24, 40), Point::new(24 + 2 * 10, 40)),
-        // Minute
         (Point::new(24 + 3 * 10, 40), Point::new(24 + 5 * 10, 40)),
-        // Second
         (Point::new(24 + 6 * 10, 40), Point::new(24 + 8 * 10, 40)),
     ];
 
-    let mut now = rtc_channel.receive().await; // Initial time value
-    let mut set_pos = 0; // Current selected field (0 = no selection)
+    let mut now = rtc_channel.receive().await;
+    let mut set_pos = 0;
 
     loop {
         display.clear_buffer();
@@ -224,17 +221,15 @@ async fn oled_display(
             last_blink_time = embassy_time::Instant::now();
         }
 
-        // Receive updated time if available
         if let Ok(new_time) = rtc_channel.try_receive() {
             now = new_time;
         }
 
-        // Check for field selection changes
         if let Ok(new_pos) = key_channel.try_peek() {
             set_pos = new_pos;
         }
 
-        // Draw cursor if in setting mode and blink state is visible
+        // Draw cursor if needed
         if cursor_visible && set_pos != 0 && set_pos <= 6 {
             let (start, end) = CURSOR_POSITIONS[set_pos as usize - 1];
             Line::new(start, end)
@@ -263,7 +258,7 @@ async fn oled_display(
             Baseline::Top
         ).draw(&mut display).unwrap();
 
-        // Render weekday (centered)
+        // Render weekday
         let weekday_str = match now.weekday() {
             Weekday::Mon => "Monday",
             Weekday::Tue => "Tuesday",
@@ -289,6 +284,7 @@ async fn oled_display(
         ticker.next().await;
     }
 }
+
 
 /// Software RTC Management Task
 ///
