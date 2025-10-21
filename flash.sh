@@ -1,0 +1,1 @@
+sudo stm32flash -w target/thumbv7m-none-eabi/release/calendar.bin -v -g 0x08000000 /dev/ttyCH341USB0 -b 9600

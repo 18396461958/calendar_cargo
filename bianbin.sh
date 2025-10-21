@@ -1,0 +1,1 @@
+arm-none-eabi-objcopy -O binary -S target/thumbv7m-none-eabi/release/calendar target/thumbv7m-none-eabi/release/calendar.bin
