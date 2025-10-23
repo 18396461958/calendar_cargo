@@ -1,13 +1,13 @@
 //! STM32F103 Blue Pill RTC日历系统（带OLED显示）
 //! =============================================================================================
-//! 
+//!
 //! 日期        作者          说明
 //! 2025/7/20   YHY           初始版本
 //! 修改者
 //! lin
-//! 
+//!
 //!==============================================================================================
-//! 
+//!
 //! 本固件实现的功能：
 //! - 使用SSD1306 OLED显示屏（128x64）通过I2C1通信
 //! - 旋转编码器用于时间调整
@@ -32,35 +32,39 @@
 //! 4. 按钮选择调整字段
 //! 5. 板载LED心跳指示灯
 
-#![no_std]          // 不使用标准库
-#![no_main]         // 不使用标准main函数
+#![no_std] // 不使用标准库
+#![no_main] // 不使用标准main函数
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike}; // 添加 Timelike trait
+use chrono::{ Datelike, NaiveDate, NaiveDateTime, Timelike, Utc }; // 合并chrono导入
 use core::fmt::Write;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_stm32::{
     bind_interrupts,
-    gpio::{Output, Speed, Level, Pull},
-    i2c::{self, EventInterruptHandler, ErrorInterruptHandler, Master},
+    flash::Flash,
+    gpio::{ Output, Speed, Level, Pull },
+    i2c::{ self, EventInterruptHandler, ErrorInterruptHandler, Master },
     peripherals,
     time::Hertz,
     exti::ExtiInput,
 };
 use embedded_graphics::{
-    mono_font::{ascii::FONT_8X13, ascii::FONT_10X20, MonoTextStyle},
+    mono_font::{ ascii::FONT_8X13, ascii::FONT_10X20, MonoTextStyle },
     pixelcolor::BinaryColor,
-    primitives::{Line, PrimitiveStyle},
+    primitives::{ Line, PrimitiveStyle },
     prelude::*,
-    text::{Baseline, Text},
+    text::{ Baseline, Text },
 };
 use embassy_sync::{
     blocking_mutex::raw::ThreadModeRawMutex,
-    channel::{Channel, Receiver, Sender},
+    channel::{ Channel, Receiver, Sender },
 };
-use embassy_time::{Ticker, Timer, Instant};
+use embassy_time::{ Ticker, Timer, Instant };
 use panic_probe as _;
-use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
+use ssd1306::{ prelude::*, I2CDisplayInterface, Ssd1306 };
+use embassy_stm32::Peri;
+use embassy_stm32::flash::Blocking;
+use chrono::TimeZone;
 
 // 通道
 static RTC_CHANNEL: Channel<ThreadModeRawMutex, NaiveDateTime, 1> = Channel::new();
@@ -74,43 +78,37 @@ async fn main(_spawner: Spawner) {
         I2C1_EV => EventInterruptHandler<peripherals::I2C1>;
         I2C1_ER => ErrorInterruptHandler<peripherals::I2C1>;
     });
-    
+
     let mut config = i2c::Config::default();
     config.frequency = Hertz(400_000);
-    
-    let i2c = i2c::I2c::new(
-        p.I2C1,
-        p.PB6,
-        p.PB7,
-        Irqs,
-        p.DMA1_CH6,
-        p.DMA1_CH7,
-        config,
-    );
+
+    let i2c = i2c::I2c::new(p.I2C1, p.PB6, p.PB7, Irqs, p.DMA1_CH6, p.DMA1_CH7, config);
 
     let key_exti = ExtiInput::new(p.PB15, p.EXTI15, Pull::Up);
 
-    _spawner.spawn(oled_display(
-        i2c, 
-        RTC_CHANNEL.receiver(), 
-        KEY_CHANNEL.receiver(),
-        embassy_time::Duration::from_millis(200)
-    )).unwrap();
+    _spawner
+        .spawn(
+            oled_display(
+                i2c,
+                RTC_CHANNEL.receiver(),
+                KEY_CHANNEL.receiver(),
+                embassy_time::Duration::from_millis(200)
+            )
+        )
+        .unwrap();
 
-    _spawner.spawn(rtc_update(
-        RTC_CHANNEL.sender(), 
-        embassy_time::Duration::from_millis(20)
-    )).unwrap();
+    // 注意：这里我们传递 p.FLASH，它的类型是 Peri<'static, FLASH>，与任务参数类型匹配
+    _spawner
+        .spawn(rtc_update(p.FLASH, RTC_CHANNEL.sender(), embassy_time::Duration::from_millis(20)))
+        .unwrap();
 
-    _spawner.spawn(key_update(
-        key_exti, 
-        KEY_CHANNEL.sender(),
-        embassy_time::Duration::from_millis(15)
-    )).unwrap();
+    _spawner
+        .spawn(key_update(key_exti, KEY_CHANNEL.sender(), embassy_time::Duration::from_millis(15)))
+        .unwrap();
 
     let mut led = Output::new(p.PC13, Level::High, Speed::Low);
     let mut ticker = Ticker::every(embassy_time::Duration::from_millis(500));
-    
+
     loop {
         led.set_low();
         ticker.next().await;
@@ -122,7 +120,7 @@ async fn main(_spawner: Spawner) {
 #[embassy_executor::task]
 async fn oled_display(
     i2c: i2c::I2c<'static, embassy_stm32::mode::Async, Master>,
-    rtc_channel: Receiver<'static, ThreadModeRawMutex, NaiveDateTime, 1>, 
+    rtc_channel: Receiver<'static, ThreadModeRawMutex, NaiveDateTime, 1>,
     key_channel: Receiver<'static, ThreadModeRawMutex, u8, 1>,
     delay: embassy_time::Duration
 ) {
@@ -131,11 +129,11 @@ async fn oled_display(
 
     let interface = I2CDisplayInterface::new(i2c);
     let mut display = Ssd1306::new(
-        interface, 
+        interface,
         DisplaySize128x64,
         DisplayRotation::Rotate0
     ).into_buffered_graphics_mode();
-    
+
     // 增强错误处理
     for _ in 0..3 {
         if display.init().is_ok() {
@@ -144,24 +142,23 @@ async fn oled_display(
         Timer::after(embassy_time::Duration::from_millis(100)).await;
     }
 
-    let year_month_day_style = MonoTextStyle::new(
-        &FONT_8X13,
-        BinaryColor::On,
-    );
+    let year_month_day_style = MonoTextStyle::new(&FONT_8X13, BinaryColor::On);
 
-    let hour_minute_second_style = MonoTextStyle::new(
-        &FONT_10X20,
-        BinaryColor::On,
-    );
+    let hour_minute_second_style = MonoTextStyle::new(&FONT_10X20, BinaryColor::On);
 
-    let weekday_style = MonoTextStyle::new(
-        &FONT_8X13,
-        BinaryColor::On,
-    );
+    let weekday_style = MonoTextStyle::new(&FONT_8X13, BinaryColor::On);
 
     // 星期字符串
-    const WEEKDAYS: [&str; 7] = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"];
-    
+    const WEEKDAYS: [&str; 7] = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ];
+
     let mut cursor_visible = false;
     let mut last_blink_time = Instant::now();
     const BLINK_INTERVAL: embassy_time::Duration = embassy_time::Duration::from_millis(500);
@@ -178,7 +175,7 @@ async fn oled_display(
     let mut now = rtc_channel.receive().await;
     let mut prev_time = now;
     let mut set_pos = 0;
-    
+
     // 初始渲染
     display.clear_buffer();
     render_display(
@@ -190,32 +187,32 @@ async fn oled_display(
         year_month_day_style,
         hour_minute_second_style,
         weekday_style,
-        &WEEKDAYS,
+        &WEEKDAYS
     );
     let _ = display.flush();
 
     loop {
         let mut needs_redraw = false;
-        
+
         // 接收新时间
         if let Ok(new_time) = rtc_channel.try_receive() {
             now = new_time;
             needs_redraw = true;
         }
-        
+
         // 接收新位置
         if let Ok(new_pos) = key_channel.try_receive() {
             set_pos = new_pos;
             needs_redraw = true;
         }
-        
+
         // 更新光标闪烁状态
         if Instant::now() - last_blink_time >= BLINK_INTERVAL {
             cursor_visible = !cursor_visible;
             last_blink_time = Instant::now();
             needs_redraw = true;
         }
-        
+
         // 只有需要时才重绘
         if needs_redraw || now != prev_time {
             display.clear_buffer();
@@ -228,9 +225,9 @@ async fn oled_display(
                 year_month_day_style,
                 hour_minute_second_style,
                 weekday_style,
-                &WEEKDAYS,
+                &WEEKDAYS
             );
-            
+
             // 更新物理显示
             display.flush().ok();
             prev_time = now;
@@ -250,56 +247,35 @@ fn render_display(
     year_month_day_style: MonoTextStyle<'_, BinaryColor>,
     hour_minute_second_style: MonoTextStyle<'_, BinaryColor>,
     weekday_style: MonoTextStyle<'_, BinaryColor>,
-    weekdays: &[&str; 7],
+    weekdays: &[&str; 7]
 ) {
     // 渲染日期
     let mut date_str = heapless::String::<16>::new();
-    write!(
-        &mut date_str,
-        "{:04}-{:02}-{:02}",
-        now.year(),
-        now.month(),
-        now.day()
-    ).unwrap();
-    
-    Text::with_baseline(
-        &date_str, 
-        Point::new(24, 4),
-        year_month_day_style, 
-        Baseline::Top
-    ).draw(display).ok();
+    write!(&mut date_str, "{:04}-{:02}-{:02}", now.year(), now.month(), now.day()).unwrap();
+
+    Text::with_baseline(&date_str, Point::new(24, 4), year_month_day_style, Baseline::Top)
+        .draw(display)
+        .ok();
 
     // 渲染时间
     let mut time_str = heapless::String::<16>::new();
-    write!(
-        &mut time_str,
-        "{:02}:{:02}:{:02}",
-        now.hour(),
-        now.minute(),
-        now.second()
-    ).unwrap();
-    
-    Text::with_baseline(
-        &time_str, 
-        Point::new(24, 21), 
-        hour_minute_second_style, 
-        Baseline::Top
-    ).draw(display).ok();
+    write!(&mut time_str, "{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second()).unwrap();
+
+    Text::with_baseline(&time_str, Point::new(24, 21), hour_minute_second_style, Baseline::Top)
+        .draw(display)
+        .ok();
 
     // 渲染星期
     let weekday_str = weekdays[now.weekday().num_days_from_monday() as usize];
     let text_width = weekday_str.len() * 8;
     let x_pos = (128 - text_width) / 2;
-    Text::with_baseline(
-        weekday_str, 
-        Point::new(x_pos as i32, 46), 
-        weekday_style, 
-        Baseline::Top
-    ).draw(display).ok();
+    Text::with_baseline(weekday_str, Point::new(x_pos as i32, 46), weekday_style, Baseline::Top)
+        .draw(display)
+        .ok();
 
     // 渲染光标
     if cursor_visible && set_pos != 0 && set_pos <= 6 {
-        let (start, end) = cursor_positions[set_pos as usize - 1];
+        let (start, end) = cursor_positions[(set_pos as usize) - 1];
         Line::new(start, end)
             .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
             .draw(display)
@@ -309,29 +285,44 @@ fn render_display(
 
 #[embassy_executor::task]
 async fn rtc_update(
-    rtc_sender: Sender<'static, ThreadModeRawMutex, NaiveDateTime, 1>, 
+    flash_peripheral: Peri<'static, peripherals::FLASH>,
+    rtc_sender: Sender<'static, ThreadModeRawMutex, NaiveDateTime, 1>,
     delay: embassy_time::Duration
 ) {
-    let mut now = NaiveDate::from_ymd_opt(2025, 7, 20)
-        .unwrap()
-        .and_hms_opt(18, 00, 00)
-        .unwrap();
+    // 获取Flash实例
+    let mut flash = Flash::new_blocking(flash_peripheral);
+
+    // Flash存储地址定义 - 使用最后1KB页（避开程序区域）
+    const FLASH_STORAGE_ADDR: u32 = 0x0800f800;
+
+    // 1. 上电后，尝试从Flash读取保存的时间
+    let mut now = read_time_from_flash(&mut flash, FLASH_STORAGE_ADDR).unwrap_or_else(|| {
+        // 如果读取失败（如第一次启动），使用默认时间
+        NaiveDate::from_ymd_opt(2025, 10, 23).unwrap().and_hms_opt(19, 00, 00).unwrap()
+    });
 
     let mut ticker = Ticker::every(delay);
     let mut last_update = Instant::now();
+    let mut last_save = Instant::now();
     const RTC_UPDATE_INTERVAL: embassy_time::Duration = embassy_time::Duration::from_secs(1);
+    const SAVE_INTERVAL: embassy_time::Duration = embassy_time::Duration::from_secs(60); // 每60秒保存一次
 
     loop {
-        // 正常时间推进（每秒更新一次）
         if Instant::now() - last_update >= RTC_UPDATE_INTERVAL {
-            now = now.checked_add_signed(chrono::Duration::seconds(1))
-                .unwrap_or(now);
+            now = now.checked_add_signed(chrono::Duration::seconds(1)).unwrap_or(now);
             last_update = Instant::now();
         }
-        
-        // 发送更新
+
+        // 2. 定期保存当前时间到Flash
+        if Instant::now() - last_save >= SAVE_INTERVAL {
+            if let Err(_e) = save_time_to_flash(&mut flash, FLASH_STORAGE_ADDR, now) {
+                // 处理保存错误，例如记录日志
+            } else {
+                last_save = Instant::now();
+            }
+        }
+
         rtc_sender.send(now).await;
-        
         ticker.next().await;
     }
 }
@@ -347,14 +338,100 @@ async fn key_update(
     loop {
         button.wait_for_falling_edge().await;
         Timer::after(debounce_delay).await;
-        
+
         if button.is_high() {
             continue;
         }
-        
+
         current_mode = (current_mode + 1) % 7;
         key_sender.send(current_mode).await;
-        
+
         button.wait_for_rising_edge().await;
     }
+}
+
+// 错误类型定义
+#[derive(Debug, defmt::Format)]
+pub enum FlashError {
+    EraseFailed,
+    WriteFailed,
+    VerificationFailed,
+    InvalidData,
+}
+
+const MAGIC_NUMBER: u32 = 0xaa55aa55; // 魔数用于验证数据有效性
+
+/// 从Flash读取时间
+pub fn read_time_from_flash(_flash: &mut Flash<'_, Blocking>, addr: u32) -> Option<NaiveDateTime> {
+    // 读取魔数验证数据有效性
+    let magic = unsafe { read_volatile_u32(addr as *const u32) };
+    if magic != MAGIC_NUMBER {
+        return None; // 数据无效或未初始化
+    }
+
+    // 读取时间戳（u64格式）
+    let timestamp_lo = (unsafe { read_volatile_u32((addr + 4) as *const u32) }) as u64;
+    let timestamp_hi = (unsafe { read_volatile_u32((addr + 8) as *const u32) }) as u64;
+    let timestamp = timestamp_lo | (timestamp_hi << 32);
+
+    // 将Unix时间戳转换为NaiveDateTime
+    match Utc.timestamp_opt(timestamp as i64, 0) {
+        chrono::LocalResult::Single(datetime) => Some(datetime.naive_utc()),
+        _ => None,
+    }
+}
+
+/// 保存时间到Flash
+pub fn save_time_to_flash(
+    flash: &mut Flash<'_, Blocking>,
+    addr: u32,
+    time: NaiveDateTime
+) -> Result<(), FlashError> {
+    // 将NaiveDateTime转换为Unix时间戳
+    let timestamp = time.and_utc().timestamp() as u64;
+
+    // 准备写入数据
+    let data: [u32; 3] = [
+        MAGIC_NUMBER, // 魔数验证
+        (timestamp & 0xffff_ffff) as u32, // 时间戳低32位
+        ((timestamp >> 32) & 0xffff_ffff) as u32, // 时间戳高32位
+    ];
+
+    // 将u32数据转换为u8字节序列
+    let bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(data.as_ptr() as *const u8, core::mem::size_of_val(&data))
+    };
+
+    // Flash操作：擦除→写入→验证
+    // 注意：Embassy STM32的Flash API会自动处理解锁和锁定
+
+    // 1. 擦除目标页
+    if flash.blocking_erase(addr, addr + 1024).is_err() {
+        return Err(FlashError::EraseFailed);
+    }
+
+    // 2. 写入数据
+    if flash.blocking_write(addr, bytes).is_err() {
+        return Err(FlashError::WriteFailed);
+    }
+
+    // 3. 验证写入
+    for (i, &expected_byte) in bytes.iter().enumerate() {
+        let verified = unsafe { read_volatile_u8((addr + (i as u32)) as *const u8) };
+        if verified != expected_byte {
+            return Err(FlashError::VerificationFailed);
+        }
+    }
+
+    Ok(())
+}
+
+// volatile读取函数（读u32）
+unsafe fn read_volatile_u32(addr: *const u32) -> u32 {
+    unsafe { core::ptr::read_volatile(addr) }
+}
+
+// volatile读取函数（读u8）
+unsafe fn read_volatile_u8(addr: *const u8) -> u8 {
+    unsafe { core::ptr::read_volatile(addr) }
 }
