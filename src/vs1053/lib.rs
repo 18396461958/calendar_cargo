@@ -75,8 +75,8 @@ const END_FILL_BYTE_BUF_LEN: u16 = 2052;
 fn map_volume(x: u8, in_min: i16, in_max: i16, out_min: i16, out_max: i16) -> u8 {
     ((((x as i16) - in_min) * (out_max - out_min + 1)) / (in_max - in_min + 1) + out_min) as u8
 }
-
-#[derive(Clone, Copy, Debug)]
+use defmt::Format;
+#[derive(Clone, Copy, Debug,Format)]
 pub enum VS1053Error<BUS, CS, DC> {
     Spi(BUS),
     Cs(CS),

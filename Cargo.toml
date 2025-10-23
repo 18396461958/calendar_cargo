@@ -30,7 +30,9 @@ bitfields = "1.0.0"
 
 
 [profile.dev]
-opt-level = "s"
+opt-level = "s"  # 优化代码大小
+lto = true        # 链接时优化
+codegen-units = 1  # 减少并行编译，可能生成更小代码
 
 [profile.release]
 debug = 2

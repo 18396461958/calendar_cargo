@@ -1,37 +1,3 @@
-use chrono::{ Datelike, NaiveDate, NaiveDateTime, Timelike, Utc }; // 合并chrono导入
-use core::fmt::Write;
-use defmt_rtt as _;
-use embassy_executor::Spawner;
-use embassy_stm32::{
-    bind_interrupts,
-    flash::Flash,
-    gpio::{ Output, Speed, Level, Pull, Input },
-    i2c::{ self, EventInterruptHandler, ErrorInterruptHandler, Master },
-    peripherals,
-    time::Hertz,
-    spi,
-    dma,
-    exti::ExtiInput,
-    mode::Async,
-};
-use embedded_graphics::{
-    mono_font::{ ascii::FONT_8X13, ascii::FONT_10X20, MonoTextStyle },
-    pixelcolor::BinaryColor,
-    primitives::{ Line, PrimitiveStyle },
-    prelude::*,
-    text::{ Baseline, Text },
-};
-use embassy_sync::{
-    blocking_mutex::raw::ThreadModeRawMutex,
-    channel::{ Channel, Receiver, Sender },
-};
-use embassy_time::{ Ticker, Timer, Instant, Delay };
-use panic_probe as _;
-use ssd1306::{ prelude::*, I2CDisplayInterface, Ssd1306 };
-use embassy_stm32::Peri;
-use embassy_stm32::flash::Blocking;
-use chrono::TimeZone;
-
 /**
  * A test sound for ESP_VS1053_Library usage example.
  * https://github.com/baldram/ESP_VS1053_Library
@@ -133,36 +99,60 @@ pub const SAMPLE_MP3:[u8; 1089] = [
 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa
 ];
-
+use crate::vs1053::lib::VS1053;
+use embassy_sync::channel::Receiver;
+use crate::AudioCommand;
+use embassy_time::Duration;
+use crate::Output;
+use crate::ThreadModeRawMutex;
+use embassy_stm32::gpio::Input;
+use embassy_stm32::mode::Async;
 #[embassy_executor::task]
-async fn mp3Play(
-    spi: spi::Spi<'static, peripherals::SPI1, Async>,
-    mp3_cs: Output<'static>,
-    mp3_dc: Output<'static>,
-    mp3_req: Input<'static>,
+pub async fn audio_player_task(
+    mut vs1053: VS1053<
+        embassy_stm32::spi::Spi<'static, Async>,
+        Output<'static>,
+        Output<'static>,
+        Input<'static>,
+        embassy_time::Delay
+    >,
+    receiver: Receiver<'static, ThreadModeRawMutex, AudioCommand, 4>,
 ) {
-    // 初始化延时
-    let delay = Delay;
+    let mut is_playing = false;
     
-    // 初始化VS1053
-    let mut vs1053 = VS1053::new(spi, mp3_cs, mp3_dc, mp3_req, delay);
-
-    match vs1053.init() {
-        Ok(_) => {
-            let _ = vs1053.set_mp3_mode_on();
-            
-            if vs1053.get_chip_version().unwrap() == 4 {
-                let _ = vs1053.load_default_patches();
+    loop {
+        let command = receiver.receive().await;
+            match command {
+                AudioCommand::Play8BitMusic => {
+                    if !is_playing {
+                        // 播放8bit音乐[9]
+                        match vs1053.write(&SAMPLE_MP3) {
+                            Ok(_) => {
+                                defmt::info!("8bit音乐播放完成");
+                                is_playing = false;
+                            }
+                            Err(e) => {
+                                defmt::error!("音乐播放错误: {:?}", e);
+                                is_playing = false;
+                            }
+                        }
+                    }
+                }
+                AudioCommand::Stop => {
+                    if is_playing {
+                        let _ = vs1053.stop_play();
+                        is_playing = false;
+                        defmt::info!("音乐已停止");
+                    }
+                }
+                AudioCommand::SetVolume(vol) => {
+                    let _ = vs1053.set_volume(vol);
+                    defmt::info!("音量设置为: {}%", vol);
+                }
             }
-            let _ = vs1053.set_volume(100);
-
-            loop {
-                let _ = vs1053.write(&SAMPLE_MP3);
-                Timer::after(embassy_time::Duration::from_millis(3000)).await;
-            }
-        }
-        Err(err) => {
-            defmt::error!("VS1053 init failed: {:?}", err);
-        }
+        
+        
+        // 短暂等待避免忙循环
+        embassy_time::Timer::after(Duration::from_millis(10)).await;
     }
 }

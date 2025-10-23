@@ -61,18 +61,78 @@ pub mod vs1053;
 pub mod task;
 
 
+// 音频命令枚举
+#[derive(defmt::Format, Clone, Copy)]
+pub enum AudioCommand {
+    Play8BitMusic,
+    Stop,
+    SetVolume(u8), // 0-100
+}
+
+
 // 通道
 static RTC_CHANNEL: Channel<ThreadModeRawMutex, NaiveDateTime, 1> = Channel::new();
 static KEY_CHANNEL: Channel<ThreadModeRawMutex, u8, 1> = Channel::new();
+static AUDIO_CHANNEL: Channel<ThreadModeRawMutex, AudioCommand, 4> = Channel::new();
 
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
+    let vs1053_hw = vs1053::vs1053_stm32::VS1053Hardware::init(
+        p.SPI1,
+        p.PA5,
+        p.PA7,
+        p.PA6,
+        p.DMA1_CH3,
+        p.DMA1_CH2,
+        p.PA4,
+        p.PA3,
+        p.PA2,
+        p.PA1,
+    ).expect("VS1053硬件初始化失败");
 		bind_interrupts!(struct Irqs {
         I2C1_EV => EventInterruptHandler<peripherals::I2C1>;
         I2C1_ER => ErrorInterruptHandler<peripherals::I2C1>;
     });
+    // 初始化VS1053驱动
+    let mut vs1053_driver = vs1053::lib::VS1053::new(
+        vs1053_hw.spi,
+        vs1053_hw.cs,
+        vs1053_hw.dc, 
+        vs1053_hw.req,
+        embassy_time::Delay,
+
+    );
+     match vs1053_driver.init() {
+        Ok(_) => {
+            defmt::info!("VS1053初始化成功");
+            
+            // 设置MP3模式并加载补丁[10](@ref)
+            if let Err(e) = vs1053_driver.set_mp3_mode_on() {
+                defmt::warn!("设置MP3模式失败: {:?}", e);
+            }
+            
+            // 加载默认补丁（修复bug和增强功能）[10](@ref)
+            if vs1053_driver.get_chip_version().unwrap_or(0) == 4 {
+                let _ = vs1053_driver.load_default_patches();
+            }
+            
+            // 设置初始音量[9](@ref)
+            let _ = vs1053_driver.set_volume(80); // 80%音量
+        }
+        Err(e) => {
+            defmt::error!("VS1053初始化失败: {:?}", e);
+        }
+    }
+
+    // 启动音频播放任务
+    spawner
+        .spawn(task::mp3::audio_player_task(
+            vs1053_driver,
+            AUDIO_CHANNEL.receiver(),
+        ))
+        .unwrap();
 
     let mut config = i2c::Config::default();
     config.frequency = Hertz(400_000);
