@@ -25,7 +25,8 @@ nb = "1.1.0"
 static_cell = "2.1.1"
 ssd1306 = { version = "0.10.0" }
 embedded-graphics = "0.8.1"
-chrono = { version = "^0.4", default-features = false}
+chrono = { version = "0.4.42", default-features = false}
+bitfields = "1.0.0"
 
 
 [profile.dev]
